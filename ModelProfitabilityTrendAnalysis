@@ -1,0 +1,823 @@
+using StatsPlots,DataFrames,Statistics,StatsBase,ODBC,StateSpaceModels,IterTools,Dates
+using GLM,MLBase
+using Pkg
+Pkg.add("Lathe")
+using Lathe
+import Lathe.preprocess: OneHotEncode
+
+
+using IterTools
+
+##create a program that MODELS CPC and RPC Rates Over TIme
+
+conn = ODBC.Connection("ricohnz-db2")
+## use Profitability and machine master
+query = """
+
+
+declare @yearsBack int = 7;
+
+select m.model,m.Account,m.IsColour,m.Model_Type,m.[Status],pas.*  from (select Mth,Serial,BlackVol,Age,ColourVol,Rev_Black,Rev_Colour,Rev_Volume,ServiceCost,Contractid from Ricoh_SAS.pbi.Profitablity_AfterSales p where Mth > dateadd(Year,-1 * @yearsBack,Mth) and Customer_division not in ('Internal','InterCompany') and DealerTerritory is null ) pas
+
+ join (select Model,Serial,Model_type,Account,Status,IsColour from Ricoh_SAS.pbi.Machine_Master m where m.Model_Type in ('CIP Black','CIP Colour','MFP Black','MFP Colour','LP Black','LP Colour')) m on pas.Serial = m.Serial
+
+
+"""
+
+
+df = DBInterface.execute(conn,query) |> DataFrame
+
+names(df)
+
+##every month I Want to see what the running costs and sell prices of each of the models are
+##mark for when the models become lossmaking
+
+
+function ModelAggregate(df,PeriodRange)
+    ##calculate for each peiod(1 month, 6 month, 12 month) the average model Running costs and Sell Prices,margin,percent margin
+    ##for period in Periods :
+
+
+    sd = minimum(df.Mth)
+    ed = maximum(df.Mth)
+    yearModelList = []
+    ##@show PeriodRange
+    periodrange = Date.(collect(sd:Month(PeriodRange):ed))
+    DR = collect(IterTools.partition(periodrange,2,1))
+
+    for pair in DR
+        #println(pair[1]," ",pair[2])
+        months =  collect(pair[1]:Month(1):pair[2])
+        #println([month for month in months])
+        size(df)[1] == 0 ? continue : nope=true
+        newdf = df[(df.Mth .< maximum(months)) .& (df.Mth .> minimum(months)),:]
+
+        #@show maximum(df.Mth),minimum(df.Mth),length(df.Serial)
+
+        modeldf = DataFrame(by(newdf, :model, [:BlackVol, :ColourVol,:Rev_Black,:Rev_Colour,:Rev_Volume,:ServiceCost] => x -> (sumBLKVol = sum(x.BlackVol),sumCOLVol = sum(x.ColourVol),sumRev = sum(x.Rev_Volume),sumBLKRev = sum(x.Rev_Black),sumCLRRev = sum(x.Rev_Colour),sumCost = sum(x.ServiceCost))))
+        ##@show names(modeldf)
+
+        @show sizeof(modeldf)[1]
+
+
+
+
+        modeldf.BlKRunCost = (modeldf.sumBLKRev ./ modeldf.sumRev) .* modeldf.sumCost ./ modeldf.sumBLKVol
+        modeldf.CLRRunCost = (modeldf.sumCLRRev ./ modeldf.sumRev) .* modeldf.sumCost ./ modeldf.sumCOLVol
+        modeldf.BLKSellPrice = modeldf.sumBLKRev ./ modeldf.sumBLKVol
+        modeldf.CLRSellPrice = modeldf.sumCLRRev ./ modeldf.sumCOLVol
+
+        modeldf.DateStart = pair[1]
+
+
+        push!(yearModelList,modeldf)
+        #@show length(yearModelList)
+
+
+    end
+
+
+
+    yearModelDf = reduce(vcat,yearModelList)
+
+
+
+
+
+
+    ##Calculate CPCS and RPCS
+
+
+
+    ##have this normalised by the lifetime of the model
+
+
+    return yearModelDf
+end
+
+
+
+function modelAgeMap(df)
+    modeldf = DataFrame(by(df, :model, [:Mth] => x -> (modelStart = minimum(x.Mth),ModelEnd = maximum(x.Mth) != Dates.now() ? maximum(x.Mth) : nothing)))
+
+    return modeldf
+end
+
+
+function ModelLifeTimeAggregate(df,PeriodRange)
+    ##calculate for each peiod(1 month, 6 month, 12 month) the average model Running costs and Sell Prices,margin,percent margin
+    ##for period in Periods :
+    sd = minimum(df.Mth)
+    ed = maximum(df.Mth)
+    agedf = modelAgeMap(df)
+    yearModelList = []
+    ##@show PeriodRange
+    periodrange = Date.(collect(sd:Month(PeriodRange):ed))
+    DR = collect(IterTools.partition(periodrange,2,1))
+    for pair in DR
+        months =  collect(pair[1]:Month(1):pair[2])
+        #println([month for month in months])
+        size(df)[1] == 0 ? continue : nope=true
+        newdf = df[(df.Mth .< maximum(months)) .& (df.Mth .> minimum(months)),:]
+        modeldf = DataFrame(by(newdf, :model, [:BlackVol, :ColourVol,:Rev_Black,:Rev_Colour,:Rev_Volume,:ServiceCost] => x -> (sumBLKVol = sum(x.BlackVol),sumCOLVol = sum(x.ColourVol),sumRev = sum(x.Rev_Volume),sumBLKRev = sum(x.Rev_Black),sumCLRRev = sum(x.Rev_Colour),sumCost = sum(x.ServiceCost))))
+        @show sizeof(modeldf)[1]
+        modeldf.BlKRunCost = (modeldf.sumBLKRev ./ modeldf.sumRev) .* modeldf.sumCost ./ modeldf.sumBLKVol
+        modeldf.CLRRunCost = (modeldf.sumCLRRev ./ modeldf.sumRev) .* modeldf.sumCost ./ modeldf.sumCOLVol
+        modeldf.BLKSellPrice = modeldf.sumBLKRev ./ modeldf.sumBLKVol
+        modeldf.CLRSellPrice = modeldf.sumCLRRev ./ modeldf.sumCOLVol
+        modeldf.DateStart = pair[1]
+        #lookup model startDate and subtract the Month from that
+        joindf = leftjoin(agedf,modeldf,on="model")
+        selectdf  = joindf[(Date.(joindf.ModelEnd) .>= Date(pair[1])) .& (Date.(joindf.modelStart) .<= Date(pair[1])),:]
+        selectdf.modelAge = round.( -1 .* Dates.value.(Date.(selectdf.modelStart) .- Date(pair[1])) ./ 30,digits=2)
+        joindf = leftjoin(joindf,selectdf,on="model",makeunique=true)
+        push!(yearModelList,joindf)
+        #@show length(yearModelList)
+    end
+
+    yearModelDf = reduce(vcat,yearModelList)
+    return yearModelDf
+end
+
+#NB! we also want to be taking Cumulative model impressions into account!!!!
+
+##calculate model averages for every Monnth
+modeldf = ModelAggregate(df,6)
+
+modeldf.DateStart
+
+modeldf.model
+modeldf.DateStart
+
+plotly()
+
+function plotModelGraph(modeldf::DataFrame,modelName::String)
+    exampledf = modeldf[modeldf.model .== modelName,:]
+    p = plot(exampledf.DateStart,exampledf.BlKRunCost,m=:o,label="BLK Run Cost")
+    plot!(exampledf.DateStart,exampledf.CLRRunCost,m=:o,label="CLR Run Cost")
+    plot!(exampledf.DateStart,exampledf.BLKSellPrice,m=:o,label="BLK Sell Price")
+    plot!(exampledf.DateStart,exampledf.CLRSellPrice,m=:o,label="CLR Sell Price"),
+    xlabel!("Month")
+    title!("Comparisons for $modelName")
+    return p
+end
+
+
+@show modeldf.model
+
+plotModelGraph(modeldf,"MP161SPF")
+
+
+function plotFleetProfitability(modeldf::DataFrame,modelSubset::Array,datefield::Symbol)
+    p = plot()
+    subdf = modeldf[modeldf.model .∈ Ref(modelSubset),:]
+
+    for modelName in modelSubset
+        exampledf = subdf[subdf.model .== modelName,:]
+        plot!(exampledf[datefield],exampledf.BLKprofitPC,label="$modelName BLKprofitPC")
+        plot!(exampledf[datefield],exampledf.CLRprofitPC,label="$modelName CLRprofitPC",legend=false,xticks = collect(minimum(exampledf[datefield]):6:maximum(exampledf[datefield])),xrotation=45)
+
+    end
+    ##xlabel!(convert(String,datefield))
+    title!("Profitability Lifetime")
+    return p
+end
+
+names(modeldf2)
+
+function plotFleetProfitabilityBC(modeldf::DataFrame,modelSubset::Array,datefield::Symbol)
+    p = plot()
+    subdf = modeldf[modeldf.model .∈ Ref(modelSubset),:]
+
+    for modelName in modelSubset
+        exampledf = subdf[subdf.model .== modelName,:]
+        plot!(exampledf[datefield],exampledf.BLKSellPrice,label="$modelName BLKSellPrice")
+        plot!(exampledf[datefield],exampledf.BlKRunCost,label="$modelName BlKRunCost")
+
+        plot!(exampledf[datefield],exampledf.CLRSellPrice,label="$modelName CLRSellPrice",legend=:topright,xticks = collect(minimum(exampledf[datefield]):6:maximum(exampledf[datefield])),xrotation=45)
+        plot!(exampledf[datefield],exampledf.CLRRunCost,label="$modelName CLRRunCost",xticks = collect(minimum(exampledf[datefield]):6:maximum(exampledf[datefield])),xrotation=45)
+
+    end
+    ##xlabel!(convert(String,datefield))
+    title!("Profitability Lifetime")
+    return p
+end
+
+
+
+
+modeldf = ModelAggregate(df,2)
+modeldf.BLKprofitPC = modeldf.BLKSellPrice .- modeldf.BlKRunCost
+modeldf.CLRprofitPC = modeldf.CLRSellPrice .- modeldf.CLRRunCost
+
+
+plotly()
+
+modelSubset = ["SP4510DN","MP301SPF","SP3600DN","IMC300F","PROC7100SX","P502"]
+
+plotFleetProfitability(modeldf,modelSubset)
+
+
+##modeldf2 = ModelLifeTimeAggregate(df,2)
+
+@show nms = names(modeldf2)
+
+plotly()
+dropmissing!(modeldf2,[:DateStart,:modelAge])
+
+modeldf2.BLKprofitPC = modeldf2.BLKSellPrice .- modeldf2.BlKRunCost
+modeldf2.CLRprofitPC = modeldf2.CLRSellPrice .- modeldf2.CLRRunCost
+modeldf2.modelAge = round.(modeldf2.modelAge)
+
+plot!()
+
+
+
+
+plotFleetProfitability(modeldf2,modelSubset,:modelAge)
+
+plotFleetProfitabilityBC(modeldf2,modelSubset,:modelAge)
+
+
+function modelAnalyze(modeldf2)
+    newdfs = []
+    for modelName in unique(modeldf2.model)
+            subdf = modeldf2[modeldf2.model .== modelName,:]
+            #subdf.BLKstateChange =
+            prev12mBLKPPC = [float(0) for i in 1:length(subdf.BLKprofitPC)]
+            prev12mCLRPPC = [float(0) for i in 1:length(subdf.CLRprofitPC)]
+
+            for i in 1:length(subdf.BLKprofitPC)
+                if i > 12
+                        prev12mBLKPPC[i] = subdf.BLKprofitPC[i - 12]
+                        prev12mCLRPPC[i] = subdf.CLRprofitPC[i - 12]
+                        ##add other fields here if you need
+                end
+                ##prev12M
+
+            end
+            subdf.prev12mBLKPPC = prev12mBLKPPC
+            subdf.prev12mCLRPPC = prev12mCLRPPC
+            push!(newdfs,subdf)
+    end
+    return vcat(newdfs...)
+
+end
+
+
+modeldf2 = modelAnalyze(modeldf2)
+
+modeldf2.percChangeBLK = modeldf2.BLKprofitPC ./ modeldf2.prev12mBLKPPC
+modeldf2.percChangeCLR = modeldf2.CLRprofitPC ./ modeldf2.prev12mCLRPPC
+
+
+using Convex,ECOS
+
+function fitToModel(df)
+    newdfs = []
+    for modelName in unique(df.model)
+        xs = df.ModelAge
+        ys =
+
+
+    end
+    return vcat(newdfs...)
+
+end
+
+temp = filterdf(modeldf2,:model,"MPC4504EX")
+temp.modelAge
+
+
+
+
+
+function profitLife(modeldf2)
+    newdfs = []
+    modeldf2 = fitToModel(modeldf2)
+
+
+    j = 0
+    BLKEnd = zeros(length(unique(modeldf2.model)))
+    CLREnd = zeros(length(unique(modeldf2.model)))
+    for modelName in unique(modeldf2.model)
+            j += 1
+            #find the last point of profitability for each model
+            subdf = modeldf2[modeldf2.model .== modelName,:]
+            maxIterBLKAge = 0
+            maxIterCLRAge = 0
+            for i in 1: length(subdf.model)
+                if subdf.BLKprofitPC[i] > 0
+                    maxIter = i
+                    maxIterBLKAge = subdf.modelAge[i]
+
+                end
+                if subdf.CLRprofitPC[i] > 0
+                    maxIter = i
+                    maxIterCLRAge = subdf.modelAge[i]
+
+                end
+
+            end
+            BLKEnd[j] = maxIterBLKAge
+            CLREnd[j] = maxIterCLRAge
+
+
+
+
+    end
+
+
+    return DataFrame(model = unique(modeldf2.model),BLKLife = BLKEnd,CLRLife = CLREnd)
+
+
+    return
+
+end
+
+
+
+modeldf2 =  join(profitLife(modeldf2),modeldf2, on = "model")
+
+
+
+modeldf2.model,modeldf2.BLKLife
+
+
+modeldf2.ModelEnd_1
+
+
+
+
+
+plot(modeldf2.modelAge,modeldf2.percChangeCLR)
+
+unique(modeldf2.model)
+
+plotFleetProfitability2(modeldf2,["PROC7100SX"],:modelAge)
+
+
+
+
+function plotFleetProfitability2(modeldf::DataFrame,modelSubset::Array,datefield::Symbol)
+    p = plot()
+    subdf = modeldf[modeldf.model .∈ Ref(modelSubset),:]
+
+    for modelName in modelSubset
+        exampledf = subdf[subdf.model .== modelName,:]
+        plot!(exampledf[datefield],exampledf.BLKprofitPC,label="$modelName BLKprofitPC")
+    #    plot!(exampledf[datefield],exampledf.prev12mBLKPPC,label="$modelName prev12mBLKPPC")
+
+        plot!(exampledf[datefield],exampledf.CLRprofitPC,label="$modelName CLRprofitPC",legend=false,xticks = collect(minimum(exampledf[datefield]):6:maximum(exampledf[datefield])),xrotation=45)
+    #    plot!(exampledf[datefield],exampledf.prev12mCLRPPC,label="$modelName prev12mCLRPPC",legend=false,xticks = collect(minimum(exampledf[datefield]):6:maximum(exampledf[datefield])),xrotation=45)
+        plot!(unique(exampledf.CLRLife),seriestype=:vline,label="$modelName CLR")
+        plot!(unique(exampledf.BLKLife),seriestype=:vline,label="$modelName BLK")
+        #plot!(exampledf[datefield],exampledf.percChangeCLR,label="$modelName percChangeCLR")
+        #plot!(exampledf[datefield],exampledf.percChangeBLK,label="$modelName percChangeBLK")
+
+
+
+
+    end
+    ##xlabel!(convert(String,datefield))
+    title!("Profitability Lifetime")
+    return p
+end
+
+
+modelProfCLRFlag = modeldf2.BLKLife .== maximum(modeldf2.modelAge) ##if N then model is still generating consistent profit
+
+modelProfBLKFlag = modeldf2.CLRLife .== maximum(modeldf2.modelAge) ##i
+
+##OK  so now have a list of machines that are only unprfoitable past a point
+##as well as a list of machines where they never made a profitLife
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+rack of whether or not the CPCs are declining and the RPCs are increasing
+
+##FIRST REMOVE ALL THE MODELS WHICH HAVE ALWAYS BEEN lossmaking
+
+function exportProblemModels(modeldf2)
+    list = []
+
+    for model in unique(modeldf2.model)
+        neverProfit = true
+        subdf = modeldf2[modeldf2.model .== model,:]
+        for row in eachrow(subdf)
+            if row.BLKprofitPC[1] > 0 || row.CLRprofitPC[1] > 0
+                neverprofit = false
+                break
+            end
+            push!(list,model)
+        end
+    end
+    return list
+end
+
+problemModels = exportProblemModels(modeldf2)
+
+modeldf2.neverProf = modeldf2.model .∈ Ref(problemModels)
+
+modeldf2
+
+plotFleetProfitabilityBC(modeldf,modelSubset,:modelAge)
+
+
+
+
+
+
+
+
+
+
+
+function trendAnalysis(modeldf2,modelSubset)
+    dflist2 = []
+    for modelName in modelSubset
+        @show modelName
+        exampledf = modeldf2[modeldf2.model .== modelName,:]
+        exampledf.prev12Months = round.(exampledf.modelAge .- 12)
+        exampledf.prev24Months = exampledf.modelAge .- 24
+        ##lookup the value for the prev12m andthen calulate the Percentage difference
+        dfList = []
+        for row in eachrow(exampledf)
+            lookrow = lookupValue(exampledf,row.prev12Months[1])
+
+            lookrow != nothing ? push!(dfList,lookrow) : doninthin=true
+
+        end
+
+
+
+
+
+        if sizeof(dfList)[1] != 0
+            lookdf = DataFrame(reduce(vcat,dfList))
+            trendf = leftjoin(exampledf,lookdf,on = "model",makeunique=true)
+            push!(dflist2,trendf)
+        else println("No History Found")
+        end
+
+
+
+
+
+
+
+    end
+
+    lookdf2 = reduce(vcat,dflist2)
+
+    return lookdf2
+
+end
+modeldf2.modelAge
+trendAnalysis(modeldf2,modelSubset)
+modeldf2.BLKprofitPC_1 = modeldf2.BLKSellPrice_1 .- modeldf2.BlKRunCost_1
+modeldf2.CLRprofitPC_1 = modeldf2.CLRSellPrice_1 .- modeldf2.CLRRunCost_1
+
+
+
+
+
+
+
+
+
+modeldf2.BlKRunCost,modeldf2.BlKRunCost_1
+
+modeldf2.BlKRunCost_1,modeldf2.BlKRunCost
+
+
+histogram(modeldf2.percChangeCLR)
+
+
+p = plot()
+
+plot!(p,modeldf2)
+
+
+
+
+
+
+@show ns = names(modeldf2)
+
+
+
+
+function lookupValue(df,agelook)
+    #@show df.modelAge, agelook
+    #@show modelName,agelook
+    if agelook >= 0
+        for i in 1:sizeof(df)[1]
+            if df.modelAge[i] == agelook
+            #println("Matched")
+            return df[i,:]
+        end
+    end
+
+    end
+
+    #@show df.modelName
+end
+
+modeldf2.
+##measure the trend at every 12 monhts
+##want to stabilise for models that have reached a certain age
+##mark if trending downwards as and current value above 0, Confirm with the next 12 Months
+#plot the trend values
+##marker to state when the profitabiliy at its "peak"
+##marker to state when model becomes lossmaking after confriming that there isnt a Profitability resurrection
+##
+##
+
+
+
+##return the
+and then
+
+modeldf2.sumBLKVol
+
+gr()
+##want to project when it is that machines are going to become unprofitable
+##print out the estimated time for machine unprofitability for each model
+
+
+##we also want to list of machines that have never returned a profit
+##poorProfitFlag = true
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+##Now Based On impressions Rather than Month
+
+function ModelImpAccum(df)
+    modeldf = DataFrame(by(df,[:model, :Mth], [:BlackVol, :ColourVol] => x -> (BLKVolCum = cumsum(x.BlackVol),CLRVolCum = cumsum(x.ColourVol),TotalVolCum = cumsum(x.ColourVol) + cumsum(x.BlackVol))))
+
+    return modeldf
+end
+
+global ModelImpAccumdf = ModelImpAccum(df)
+
+df
+
+names(df)
+
+
+filterdf(df,field,result) = df[df[field] .== result ,:]
+
+
+###Building a regresssion Model
+df.BlackVol
+
+
+df.ColourVol,df.Rev_Black
+function regress(df)
+    keys = []
+    values = []
+    for modelname in df.model
+        #build a regressionmodel for each model
+         modeldf = filterdf(df,:model,modelname)
+         modeldf.BlKRunCost = (modeldf.Rev_Black ./ modeldf.Rev_Volume) .* modeldf.ServiceCost ./ modeldf.BlackVol
+         modeldf.CLRRunCost = (modeldf.Rev_Colour ./ modeldf.Rev_Volume) .* modeldf.ServiceCost ./ modeldf.ColourVol
+         modeldf.BLKSellPrice = modeldf.Rev_Black ./ modeldf.BlackVol
+         modeldf.CLRSellPrice = modeldf.Rev_Colour ./ modeldf.ColourVol
+         modeldf.BLKPPC = modeldf.BLKSellPrice .- modeldf.BlKRunCost
+
+         modeldf.CLRPPC = modeldf.CLRSellPrice .- modeldf.CLRRunCost
+
+
+
+         filter!(:BLKPPC => BLKPPC -> !(ismissing(BLKPPC) || isnothing(BLKPPC) || isnan(BLKPPC)), modeldf)
+
+         if modeldf.IsColour[1] == 1
+             filter!(:CLRPPC => CLRPPC -> !(ismissing(CLRPPC) || isnothing(CLRPPC) || isnan(CLRPPC)), modeldf)
+             m = buildmodel(modeldf,col=true)
+         else
+             m = buildmodel(modeldf)
+         end
+         ##remove outliers in the y values
+
+         push!(keys,modelName)
+         push!(values,m)
+
+
+     end
+     return Dict(keys .=> values)
+
+end
+
+
+df.IsColour,df.BlackVol,df.ColourVol,df.Rev_Black,df.
+df.model,df.Model_Type,df.Mth,df.Status,df.Serial,df.Account,df.Model_Type,df.Model_Type,df.Contractid
+
+
+using Lathe
+
+using CategoricalArrays
+
+function buildmodel(df,colour=false)
+    # Outlier removal
+    #@show [df.BLKPPC[i] for i in df.BLKPPC if isnan(i)]
+    #dropnan!(df,[:BLKPPC, :CLRPPC])
+
+
+    first_percentile1 = percentile(df.BLKPPC, 25)
+    iqr_value1 = iqr(df.BLKPPC)
+    logic1 = df.BLKPPC .>  (first_percentile1 - 1.5*iqr_value1)
+
+    if colour == true
+
+
+        first_percentile2 = percentile(df.CLRPPC, 25)
+        iqr_value2 = iqr(df.BLKPPC)
+        logic2 = df.CLRPPC .>  (first_percentile2 - 1.5*iqr_value2)
+        df = df[logic1 .& logic2 ,:]
+
+    end
+
+    df = df[logic1,:]
+    println("Encoding ...")
+
+
+    df.scaledAccount = assign(df[:Account])
+
+    df.scaledModelType = assign(df[:Model_Type] )
+    df.IsColour = assign(df.IsColour)
+    select!(df,Not([:Account,:Serial,:model,:Mth,:Model_Type,:Status,:Contractid]))
+    @show head(df)
+
+
+
+
+
+
+
+
+    println("Preprocessing done.")
+    train, test = TrainTestSplit(df,.75)
+
+    dropmissing!(df,[:BLKPPC,:Age,:BlKRunCost,:BLKSellPrice,:scaledModelType,:scaledAccount,:IsColour,:BlackVol,:Rev_Black,:ServiceCost])
+    [df[!,column] = convert.(Float64,df[!,column]) for column in [:BLKPPC,:Age,:BlKRunCost,:BLKSellPrice,:scaledModelType,:scaledAccount,:IsColour,:BlackVol,:Rev_Black,:ServiceCost]]
+
+
+
+    @show StatsBase.corspearman(df)
+    fm1 = @formula(BLKPPC ~ Age + BlKRunCost + BLKSellPrice + scaledModelType + scaledAccount + IsColour + Rev_Black  + ServiceCost)
+
+
+    linearRegressor1 = lm(fm1, train)
+
+    if colour == true
+        dropmissing!(df,[:CLRPPC,:BLKPPC,:CLRRunCost,:CLRSellPrice,:ColourVol,:Rev_Colour,:Age,:BlKRunCost,:BLKSellPrice,:scaledModelType,:scaledAccount,:IsColour,:BlackVol,:Rev_Black,:ServiceCost])
+        [df[!,column] = convert.(Float64,df[!,column]) for column in [:CLRPPC,:BLKPPC,:CLRRunCost,:CLRSellPrice,:ColourVol,:Rev_Colour,:Age,:BlKRunCost,:BLKSellPrice,:scaledModelType,:scaledAccount,:IsColour,:BlackVol,:Rev_Black,:ServiceCost]]
+
+        fm2 = @formula(CLRPPC ~ Age + BlKRunCost + CLRRunCost + BLKSellPrice + CLRSellPrice + scaledModelType + scaledAccount + IsColour + BlackVol + ColourVol + ServiceCost)
+        colourRegressor = lm(fm2, train)
+
+        fm3 = @formula(BLKPPC ~ Age + BlKRunCost + CLRRunCost + BLKSellPrice + CLRSellPrice + scaledModelType + scaledAccount + IsColour + BlackVol + ColourVol + ServiceCost)
+
+
+        blackRegressor = lm(fm3,train)
+
+        return blackRegressor,colourRegressor
+
+
+    end
+
+    #@show r2(linearRegressor)
+
+
+    return linearRegressor1
+
+
+
+
+end
+
+function assign(array)
+    ##encodes categorical variables
+    uniqueItems = unique(array)
+    uniqueNums = zeros(length(uniqueItems))
+    i = 1
+    for item in uniqueItems
+        uniqueNums[i] = i
+        i += 1
+    end
+    @show length(uniqueItems),length(uniqueNums)
+
+    mapping = Dict(uniqueItems .=> uniqueNums)
+
+    return [mapping[item] for item in array]
+
+end
+
+function corna(x, y)
+    b = !(isna(x) | isna(y))
+    cor(x, y)
+end
+
+
+function Base.cor(df::AbstractDataFrame)
+    [corna(x[2], y[2]) for x=eachcol(df), y=eachcol(df)]
+end
+
+regress(df)
+
+
+
+df.IsColour
+
+
+
+using Statistics,StatsBase
+
+function ModelLifeTimeSS(df,modelSubset)
+    p = plot()
+    df2 = df[df.model .∈ Ref(modelSubset),:]
+    modelTrackDF=[]
+
+    for model in unique(df2.model)
+        subdf = df2[df2.model .== model,:]
+        ##SSModel
+        m1 = LocalLinearTrend(Vector{Float64}(subdf.BLKprofitPC))
+        StateSpaceModels.fit!(m1)
+
+        so1 = kalman_smoother(m1)
+
+        #plot!(p,subdf.modelAge,get_smoothed_state(so1),label = "smoothed $model BLKPPC")
+        #plot!(p,subdf.modelAge,get_filtered_state(so1),label = "smoothed $model BLKPPC")
+
+
+
+        m2 = LocalLinearTrend(Vector{Float64}(subdf.CLRprofitPC))
+        StateSpaceModels.fit!(m2)
+        @show m2
+        so2 = kalman_smoother(m2)
+        #plot!(p,subdf.modelAge,get_smoothed_state(so2),label = "smoothed $model COLPPC",legend=false)
+        #plot!(p,subdf.modelAge,m2.,label = "smoothed $model COLPPC",legend=false)
+        push!(captureLossState(so1,so2,subdf),modelTrackDF)
+
+    end
+    return reduce(vcat,modelTrackDF)
+
+end
+
+function captureLossState(ss1,ss2,subdf)
+
+    @show get_smoothed_state(ss2)
+    subdf.CLRLossState = get_smoothed_state(ss2) .< [0 for i in 1:length(get_smoothed_state(ss1))]
+
+    return subdf
+
+end
+
+
+ModelLifeTimeSS(modeldf2,modelSubset)
+
+
+
+
+##Have a separate graph to track the costs and rPCs of each Model
+
+
+modeldf2.BLKprofitPC,modeldf2.CLRprofitPC
+
+
+
+problemModeldf = df[df.model .∈ Ref(problemModels),:]
+using CSV
+CSV.write("C://Users//Ajefferi//Documents//problemModels.csv",problemModeldf)
