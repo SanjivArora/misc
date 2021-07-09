@@ -1,0 +1,1 @@
+c:\ProgramData\Anaconda3\python.exe "\\ricohdc-data\MachineLearning$\R - AtRemote project\Scripts\trial_daily.py" > c:\scripts\trial_daily.log 2>&1
