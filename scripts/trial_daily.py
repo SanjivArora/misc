@@ -25,10 +25,12 @@ import awscli
 import awscli.clidriver
 
 from data_download_s3 import copy_all
+import sync_dispatch
 
 
 # Prod server instance ID in AWS
 instance_id = 'i-00e8df1734a9e2177'
+
 cyg_bash = r'c:\cygwin64\bin\bash.exe'
 ssh = '/usr/bin/ssh'
 
@@ -132,6 +134,13 @@ def toner_prediction_fleet(instance):
     cmd=["cd ~/toner; python3 scripts/predict_fleet.py"]
     remote_run(instance, cmd)
 
+def predict_toner_dispatch(instance):
+    cmd=["cd ~/toner; python3 scripts/predict_dispatch.py"]
+    remote_run(instance, cmd)
+
+def sync_toner_dispatch(instance):
+    sync_dispatch.sync_dispatch()
+
 def run():
     instance = get_instance()
     try:
@@ -151,7 +160,7 @@ def run():
 ##                predict(instance, device_group)
 ##            except:
 ##                traceback.print_exc()
-        for f in [update_toner_src, generate_dataset, toner_prediction_auckland, toner_prediction_fleet]:
+        for f in [update_toner_src, generate_dataset, toner_prediction_auckland, toner_prediction_fleet, predict_toner_dispatch, sync_toner_dispatch]:
             try:
                 f(instance)
             except:
