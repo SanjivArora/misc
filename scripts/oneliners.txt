@@ -1,0 +1,14 @@
+# SSH to dev
+ssh -p443 ec2-user@ec2-52-62-161-18.ap-southeast-2.compute.amazonaws.com
+
+# Backup code
+rsync -avz --delete -e "ssh -p 443" git@ec2-54-206-42-115.ap-southeast-2.compute.amazonaws.com:prediction.git prediction.git
+
+# Sync data
+rsync -avz -e "ssh -p 443" /cygdrive/k/BI/R\ -\ AtRemote\ project/Data/* ec2-user@ec2-52-62-161-18.ap-southeast-2.compute.amazonaws.com:/home/rstudio/data/
+
+# Sync prediction results
+rsync -avz --no-perms --no-owner --no-group -e "ssh -p 443"  ec2-user@ec2-52-62-161-18.ap-southeast-2.compute.amazonaws.com:/home/rstudio/prediction/predictions/ /cygdrive/k/Machine\ Learning/Trial\ Predictions/
+
+# Sync existing results back to dev server
+rsync -avz --no-perms --no-owner --no-group -e "ssh -p 443"  /cygdrive/k/Machine\ Learning/Trial\ Predictions/ rstudio@ec2-52-62-161-18.ap-southeast-2.compute.amazonaws.com:/home/rstudio/prediction/predictions/

@@ -1,0 +1,31 @@
+ sudo -i
+
+# SSH to listen on port 443
+/usr/sbin/sshd -p 443
+echo "/usr/sbin/sshd -p 443" >> /etc/rc.d/rc.local
+chmod +x /etc/rc.d/rc.local
+
+# Install RStudio
+rpm -ivh https://dl.fedoraproject.org/pub/epel/epel-release-latest-7.noarch.rpm
+yum -y install R
+wget https://download2.rstudio.org/rstudio-server-rhel-1.1.456-x86_64.rpm
+yum -y install rstudio-server-rhel-1.1.456-x86_64.rpm
+
+# Add rstudio user
+useradd -m rstudio
+echo "rstudio" | passwd rstudio --stdin
+
+# Utils
+yum -y install nethogs git tmux vim iotop
+
+# Dependencies
+yum -y install openssl-devel libcurl-devel libxml2-devel
+                        
+
+# Set permanent hostname to avoid confusion
+hostnamectl set-hostname dev-smat
+
+# As rstudio:
+git config --global user.name "Solomon Matthews"
+git config --global user.email "smatthews@ricoh.co.nz"
+
