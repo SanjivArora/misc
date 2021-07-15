@@ -1,4 +1,4 @@
-using ODBC,StatsPlots,DataFrames,Statistics,StatsBase,ScikitLearn
+using ODBC,StatsPlots,DataFrames,Statistics,StatsBase,ScikitLearn,VegaLite
 
 
 using ScikitLearn.CrossValidation: cross_val_score,cross_val_predict
@@ -9,12 +9,13 @@ using ScikitLearn.CrossValidation: cross_val_score,cross_val_predict
 @sk_import linear_model: LinearRegression
 
 
+
 conn = ODBC.Connection("ricohnz-db2")
 
 query = """
 
 with t1 as (
-SELECT mm.Serial,mm.isColour,Model,totalBlk,totalCOL,totalVol,totalTonerCost,case when totalCol = 0 then totalServiceCost else 0.2 * totalServiceCost end as totalBlackCost,case when totalCol = 0 then 0 else 0.8 * totalServiceCost end as totalColourCost,totalServiceCost
+SELECT mm.Serial,isColour,Model,totalBlk,totalCOL,totalVol,totalTonerCost,case when totalCol = 0 then totalServiceCost else 0.2 * totalServiceCost end as totalBlackCost,case when totalCol = 0 then 0 else 0.8 * totalServiceCost end as totalColourCost,totalServiceCost
 
   FROM [Ricoh_SAS].[dbo].[MachineMileageTimeline] mt join Ricoh_SAS.pbi.Machine_Master mm
   on mm.Serial = mt.Serial)
@@ -26,76 +27,138 @@ df = DBInterface.execute(conn,query)|> DataFrame
 
 
 
+
+
+
 function Evolution(df,model)
 
     df = df[df.Model .== model,:]
     serials = unique(df.Serial)
-    println("Excluding Serials")
+    #println("Excluding Serials")
     #@show sizeof(df)
     removals = removeSerials(df)
     #@show sizeof(df)
     df = df[df.Serial .∉ Ref(removals),:]
     #@show sizeof(df)
-    println("finding exceptions")
+    #println("finding exceptions")
 
-    outliers = IsolateOutliers(df,serials)
+    @time outliers = IsolateOutliers(df,serials)
     if length(outliers) == 0
-        outp,outblackCPCs,outcolourCPCs = [0],[0],[0]
+        outp_black,outp_colour,outblackCPCs,outcolourCPCs = [0],[0],[0],[0]
         @goto label6
     end
     outlierdf = df[df.Serial .∈ Ref(outliers),:]
-    println("Outputting Outliers")
-    outp,outblackCPCs,outcolourCPCs = OutputValues(outlierdf)
+    #println("Outputting Outliers")
+    outp_black = OutputValues(outlierdf,:totalBlk,:totalBlackCost)
+    outp_colour = OutputValues(outlierdf,:totalCOL,:totalColourCost)
+
+    outblackCPCs,outcolourCPCs = retrieveCPCS(model,outliers)
+
     df = df[df.Serial .∉ Ref(outliers),:]
 
     @label label6
-    
-    
 
-    @show sizeof(df)
-    println("Sorting by Serial")
-    sort!(df,:Serial)
-    @show sizeof(df)
+    #@show sizeof(df)
+    #println("Sorting by Serial")
+    sort!(df,[:Serial,:totalVol])
+    #@show sizeof(df)
     ##reshape for the evolution of each serial
-    println("Outputting Values")
+    #println("Outputting Values")
 
-    p,blackCPCs,colourCPCs = OutputValues(df)
+    p_col = OutputValues(df,:totalBlk,:totalBlackCost)
+    p_blk = OutputValues(df,:totalCOL,:totalColourCost)
+
+    blackCPCs,colourCPCs = retrieveCPCS(model,unique(df.Serial))
 
 
-    return p,blackCPCs,colourCPCs,outp,outblackCPCs,outcolourCPCs
+
+    return p_col,p_blk,blackCPCs,colourCPCs,outp_colour,outp_black,outblackCPCs,outcolourCPCs
 
 end
 
 
-function OutputValues(df)
-    newdf = unstack(df,:totalVol,:Serial,:totalServiceCost)
-    xs = newdf.totalVol
+function OutputValues(df,blackorColourVol::Symbol,blackColServiceCost::Symbol)
+
+    #println("Pivoting...")
+    newdf = unstack(df,blackorColourVol,:Serial,blackColServiceCost)
+    xs = newdf[blackorColourVol]
+    #println("Checking size of xs..")
+    if length(xs) == 0
+        println("No values found")
+        return plot(),[0],[0]
+    end
+
+    #println("Checking size of df..")
+    if sizeof(df)[1] == 0
+            println("No values found")
+            return plot(),[0],[0]
+    end
+    #println("Isolating ys...")
     ys = newdf[:,2:end]
 
-    if sizeof(ys)[1] == 0
-        println("No values for $model found")
-        return
-    end
-    
+
     serials = names(ys)
     if length(serials) == 0
-        return
+        return plot(),[0],[0]
     end
     #@show serials
+    #println("Converting to matrix ...")
     ys = Matrix(ys)
-    p = plot(xs,ys,xlabel = "total Volumes",hover = serials,m=:o,ylabel= "total Service Costs",leg=:false)
-    println("calculating CPCs")
+    p1 = plot(xs,ys,xlabel = "$(string(blackorColourVol))",hover = serials,m=:o,ylabel= "$(string(blackColServiceCost))",leg=:false)
 
-    max_blackCPCs = [df[df.Serial .== serial,:].BlackCPC[end] for serial in unique(df.Serial)]
-    max_colourCPCs = [df[df.Serial .== serial,:].colourCPC[end] for serial in unique(df.Serial)]
+    #println("calculating CPCs")
 
-    return p,max_blackCPCs,max_colourCPCs
+    ##BlackCPs,ColourCPCs = retrieveCPCs(model,Blacklist)
+
+    ##max_blackCPCs = [df[df.Serial .== serial,:].BlackCPC[end] for serial in unique(df.Serial)]
+    ##max_colourCPCs = [df[df.Serial .== serial,:].colourCPC[end] for serial in unique(df.Serial)]
+
+
+
+
+
+
+
+
+
+    return p1
 
 end
 
+function retrieveCPCS(model,serialList)
+    baseList = "("
+    for serial in serialList
+        baseList =  baseList *"'$serial',"
+end
+    baseList = baseList[1:length(baseList)-1]*")"
+
+
+
+    retrievalQuery = """
+    with t2 as (
+    select serial,sum(blackVOl) as BlackVol,sum(colourVol) as ColourVol,sum(case when iscolour=1 then 0.2*ServiceCost else 0.8*ServiceCost end) as BlackCost,sum(case when iscolour=1 then 0.8*ServiceCost else 0 end) as ColourCost
+    from Ricoh_SAS.pbi.Profitablity_AfterSales
+     where model = '$model'
+
+    and serial in $baseList
+
+     group by Serial
+     )
+     select Serial,blackCost / nullif(blackVol,0) as BlackCPC, colourCost / nullif(ColourVol,0) as ColourCPC  from t2
+    """
+
+    #println(retrievalQuery)
+
+    CPCdf = DBInterface.execute(conn,retrievalQuery) |> DataFrame
+
+
+
+
+    return CPCdf.BlackCPC,CPCdf.ColourCPC
+
+end
 
 plotly()
-
 
 function removeSerials(df)
     removals = []
@@ -121,11 +184,7 @@ function IsolateOutliers(df,serials)
     unique_serials = unique(df.Serial)
 
     ##new_serials = unique_serials[unique_serials .∉ Ref(volumeOuts)]
-
-
     max_serviceCosts = [df[df.Serial .== serial,:].totalServiceCost[end] for serial in unique_serials]
-
-
     max_blackvols = [df[df.Serial .== serial,:].totalBlk[end] for serial in unique_serials ]
     max_colvols = [df[df.Serial .== serial,:].totalCOL[end] for serial in unique_serials]
     max_blackCosts = [df[df.Serial .== serial,:].totalBlackCost[end] for serial in unique_serials]
@@ -266,9 +325,6 @@ function findOutliers3(x,y)
         #lm = fit!(Lasso(),x,y)
 
 
-
-
-
         if length(unique(x)) == 1 && unique(x)[1] == 0.0
             return outlierPos
         end
@@ -301,7 +357,7 @@ function findOutliers3(x,y)
 
 
 
-        println("Linear Model Built")
+        #println("Linear Model Built")
 
         ##finding Outliers
 
@@ -313,46 +369,173 @@ function findOutliers3(x,y)
 end
 
 
+
 function modelEvolutionCPCs(df,model)
-    p1,BlackCPCs,ColourCPCs,outP,OutsBlackCPC,OutsColourCPC = Evolution(df,model)
-    avgBlackCPCs = 100 .* mean(BlackCPCs)
-    stdBlackCPCs=  100 .* std(BlackCPCs)
-    avgColourCPCs = 100 .* mean(ColourCPCs)
-    stdColourCPCs=  100 .* std(ColourCPCs)
 
-    plot!(p1,title="$model")
-    dir = "C://Users//Ajefferi//Documents//Model Lifetime Analysis"
-    savefig(p1,"C://Users//Ajefferi//Documents//Model Lifetime Analysis//$model")
-    outtext = "\nModel: $model\n Estimated Black CPC: $avgBlackCPCs \n Stdev: $stdBlackCPCs \n EstimatedColourCPC $avgColourCPCs \n Stdev: $stdColourCPCs"
-    open("C://Users//Ajefferi//Documents//Model Lifetime Analysis//CPCs.txt","a") do io
-       write(io, outtext)
-   end
 
-   avgBlackCPCs = 100 .* mean(OutsBlackCPC)
-   stdBlackCPCs=  100 .* std(OutsBlackCPC)
-   avgColourCPCs = 100 .* mean(OutsColourCPC)
-   stdColourCPCs=  100 .* std(OutsColourCPC)
-   if outP == [0]
-       return
-   end
-   plot!(outP,title="$model")
-   dir = "C://Users//Ajefferi//Documents//Model Lifetime Analysis//Outliers//$model"
-   savefig(outP,"C://Users//Ajefferi//Documents//Model Lifetime Analysis//Outliers//$model")
-   outtext = "\nModel: $model\n Estimated Black CPC: $avgBlackCPCs \n Stdev: $stdBlackCPCs \n EstimatedColourCPC $avgColourCPCs \n Stdev: $stdColourCPCs"
-   open("C://Users//Ajefferi//Documents//Model Lifetime Analysis//OutCPCs.txt","a") do io
-      write(io, outtext)  end
+	p1blk,p1col,BlackCPCs,ColourCPCs,outpblk,outpcol,OutsBlackCPC,OutsColourCPC = Evolution(df,model)
+
+	##outPutBlack CPCs then blackOutliers with error handling
+	avgBlackCPCs = 0.0
+	stdBlackCPCs = 0.0
+	avgBlackOutCPCs = 0.0
+	stdBlackOutCPCs = 0.0
+
+	avgColourCPCs = 0.0
+	stdColourCPCs = 0.0
+	avgColourOutCPCs = 0.0
+	stdColourOutCPCs = 0.0
+
+
+	missingBool = ismissing.(BlackCPCs)
+	if length(missingBool[missingBool .== 0]) == 0 ##all of the values are "missing"
+		return
+
+	else
+
+
+
+
+		    avgBlackCPCs,stdBlackCPCs = centreSpread3(BlackCPCs)
+
+        	plot!(p1blk,title="$model Black")
+        	savefig(p1blk,"C://Users//Ajefferi//Documents//Model Lifetime Analysis//$model Black")
+
+		##black Outliers
+        @show outpblk
+		if outpblk == [0] ##NO outliers
+            		@goto toColour
+        end
+
+
+		missingBool = ismissing.(OutsBlackCPC)
+		if length(missingBool[missingBool .== 0]) == 0 ##all of the values are "missing"
+			@goto toColour
+
+		else
+			avgBlackOutCPCs,stdBlackOutCPCs = centreSpread3(OutsBlackCPC)
+
+			plot!(outpblk,title="$model Black")
+        	savefig(outpblk,"C://Users//Ajefferi//Documents//Model Lifetime Analysis//Outliers//$model Black")
+		end
+        end
+	@label toColour
+	missingBool = ismissing.(ColourCPCs)
+	if length(missingBool[missingBool .== 0]) == 0 #all of the values are "missing"
+		return
+	else
+        avgColourCPCs,stdColourCPCs = centreSpread3(ColourCPCs)
+
+    	plot!(p1col,title="$model Colour")
+    	savefig(p1col,"C://Users//Ajefferi//Documents//Model Lifetime Analysis//$model Colour")
+		##black Outliers
+        #@show outpcol
+		if outpcol == [0] ##NO outliers
+            return
+        end
+
+
+		missingBool = ismissing.(OutsColourCPC)
+		if length(missingBool[missingBool .== 0]) == 0 ##all of the values are "missing"
+			return
+
+		else
+
+			avgColourOutCPCs,stdColourOutCPCs = centreSpread3(OutsColourCPC)
+
+			plot!(outpcol,title="$model Colour")
+        	savefig(outpcol,"C://Users//Ajefferi//Documents//Model Lifetime Analysis//Outliers//$model Colour")
+
+		end
+
+        end
+
+	##outPutCOlour CPCs then COlourOutliers with error handling
+
+	#print the file with Both the Black CPCs,ColourCPCs,and Outlier CPCs
+
+
+	outtext = "\nModel: $model\n Estimated Black CPC: $avgBlackCPCs \n Black Spread: $stdBlackCPCs \n EstimatedColourCPC: $avgColourCPCs \n Colour Spread: $stdColourCPCs"
+
+	out2text = "\nModel: $model\n Estimated Black CPC Outliers: $avgBlackOutCPCs \n  Black Spread Outliers: $stdBlackOutCPCs \n EstimatedColourCPC Outliers: $avgColourOutCPCs \n Colour Spread Outliers: $stdColourOutCPCs"
+
+	outputText = outtext  * "\n Outliers: " * out2text
+
+	open("C://Users//Ajefferi//Documents//Model Lifetime Analysis//OutCPCs.txt","a") do io
+	write(io, outputText )end
+
 end
+
+function centreSpread1(CPCs)
+
+    ##plain average
+    centre = Statistics.mean(CPCs)
+    stds = Statistics.stdm(CPCs,centre)
+    return stds,centre
+end
+
+
+
+function centreSpread2(arr)
+
+    ## average excluding outliers method 1
+    testdf = DataFrame(vals=arr)
+    dropmissing!(testdf)
+    arr = testdf.vals
+    subarr = arr[arr .> 0]
+    norms = []
+    if length(subarr) == 0
+        return
+    end
+    z = abs.(StatsBase.zscore(arr))
+
+    for i in 1:length(arr)
+        if z[i] <= 3
+            push!(norms,arr[i])
+        end
+    end
+
+    if length(norms) == 0
+        return
+    end
+
+
+    centre = Statistics.mean(norms)
+    stds = Statistics.stdm(norms,centre)
+
+
+    return stds,centre
+
+
+
+end
+
+
+
+
+function centreSpread3(CPCs)
+
+    ## Median
+    centre = 100 * median(skipmissing(CPCs))
+    IQR = 100 * iqr(skipmissing(CPCs))
+
+
+    return IQR,centre
+
+end
+
+
+
+
 ##add a line of best fit
 
 function runProgram()
     i = 0
-    file = open("C://Users//Ajefferi//Documents//Model Lifetime Analysis//CPCs.txt","w")
-    write(file,"")
-    close(file)
+
     file = open("C://Users//Ajefferi//Documents//Model Lifetime Analysis//OutCPCs.txt","w")
     write(file,"")
     close(file)
-    models = sort(unique(df.Model))
+    models = sort(unique(df.Model),rev=true)
     for model in models
         i += 1
         try
@@ -360,10 +543,10 @@ function runProgram()
             modelEvolutionCPCs(df,model)
             println("Model Evolution Completed")
         catch e
-            if e == InterruptException()
+            if isa(e,typeof(InterruptException()))
                 return
             else
-                println("$e Exception Occurred  ")
+                println("$e Exception Occurred")
                 #@show stacktrace(catch_backtrace())
                 #@show catch_backtrace()
                 continue
@@ -373,18 +556,184 @@ function runProgram()
 end
 
 
-function runProgram2()
+function runProgram2(df)
     i = 0
-    file = open("C://Users//Ajefferi//Documents//Model Lifetime Analysis//CPCs.txt","w")
+    file = open("C://Users//Ajefferi//Documents//Model Lifetime Analysis//OutCPCs.txt","w")
     write(file,"")
     close(file)
-    models = sort(unique(df.Model))
-    for model in models[10:end]
-        i += 1
+    models = unique(df.Model)
+
+    modelSubset = models
+
+    for model in modelSubset
+        try
+            i += 1
             println("Calculating For Model $model, $i of $(length(unique(df.Model)))")
-            modelEvolutionCPCs(df,model)
+            @time modelEvolutionCPCs(df,model)
             println("Model Evolution Completed")
+        catch e
+            if isa(e,typeof(InterruptException()))
+                return
+            else
+                println("$e Exception Occurred")
+                #@show stacktrace(catch_backtrace())
+                #@show catch_backtrace()
+                continue
+            end
         end
+    end
+
+    newdf,Outdf = filetoDF(i)
+    return newdf,Outdf
+end
+
+#@time runProgram()
+
+
+
+##ways to programatically filter out the non-regular CharacteristicFunctions
+##FILTER THE OUTLIERS
+
+
+@label endTest
+
+
+
+
+using DelimitedFiles
+
+function filetoDF(n)
+    data = readlines("C://Users//Ajefferi//Documents//Model Lifetime Analysis//OutCPCs.txt")
+    data = string.(data)
+    #number of Models
+    dataMat = Array{Any}(nothing, (n,5))
+    outlierMat = Array{Any}(nothing, (n,5))
+    outlierBool = false
+    ns = []
+    i=1
+    j = 1
+    for line in data
+
+        @show line
+        if line == ""
+            continue
+
+        else
+            @show name,value = split(line,": ")
+
+            if name == " Outliers"
+                outlierBool = true
+                j += 1
+            end
+            if outlierBool == true
+                if name == "Model"
+                    dataMat[CartesianIndex(j,1)] = value
+                elseif name == " Estimated Black CPC"
+                    dataMat[CartesianIndex(j,2)] = value
+                elseif name == " Black Spread"
+                    dataMat[CartesianIndex(j,3)] = value
+                elseif name == " EstimatedColourCPC"
+                    dataMat[CartesianIndex(j,4)] = value
+                elseif name == " Colour Spread"
+                    dataMat[CartesianIndex(j,5)] = value
+                end
+                outlierBool = false
+
+            else
+                if name == "Model"
+                    dataMat[CartesianIndex(j,1)] = value
+                elseif name == " Estimated Black CPC"
+                    dataMat[CartesianIndex(j,2)] = value
+                elseif name == " Black Spread"
+                    dataMat[CartesianIndex(j,3)] = value
+                elseif name == " EstimatedColourCPC"
+                    dataMat[CartesianIndex(j,4)] = value
+                elseif name == " Colour Spread"
+                    dataMat[CartesianIndex(j,5)] = value
+                end
+
+            end
+
+        end
+        i += 1
+    end
+
+    df = DataFrame(dataMat)
+    @show df
+    rename!(df,[:Model,:BlackCPC,:BlackSpread,:ColourCPC,:ColourSpread])
+    outlierdf = DataFrame(outlierMat)
+
+    rename!(outlierdf,[:Model,:BlackCPC,:BlackSpread,:ColourCPC,:ColourSpread])
+
+    return df,outlierdf
+
+end
+    ##concat the names to the matrix
+data,outlierdata = runProgram2(df)
+
+println(data)
+
+
+
+
+
+##Nice Scatter StatsPlots
+
+
+
+##scatter Plot of CPC evaluations for each Model
+
+function runProgram3(df,field1,field2,blackcol)
+    i = 0
+    #file = open("C://Users//Ajefferi//Documents//Model Lifetime Analysis//Scatterplots","w")
+    #write(file,"")
+    #close(file)
+    models = unique(df.Model)
+    modelSubset = models
+    for model in modelSubset
+        try
+            i += 1
+            println("Plotting For Model $model, $i of $(length(unique(df.Model)))")
+
+            p = df |>
+            @vlplot(
+            :line,
+            x=field1,
+            y=field2,
+            width = 400,
+            height = 500
+            )
+
+            VegaLite.save("C://Users//Ajefferi//Documents//Model Lifetime Analysis//ScatterPlots//$blackcol $model.svg",p)
+
+
+
+
+
+
+            println("Model Scatter Completed")
+
+        catch e
+            if isa(e,typeof(InterruptException()))
+                return
+            else
+                println("$e Exception Occurred")
+                #@show stacktrace(catch_backtrace())
+                #@show catch_backtrace()
+                continue
+            end
+
+
+
+        end
+    end
+
+
+
+
+
+    #newdf,Outdf = filetoDF(i)
+
 end
 
 
@@ -393,10 +742,8 @@ end
 
 
 
-runProgram()
 
 
-runProgram2()
+runProgram3(df,:totalBlk,:BlackCPC,"Black")
 
-##ways to programatically filter out the non-regular CharacteristicFunctions
-##FILTER THE OUTLIERS
+runProgram3(df,:totalCOL,:ColourCPC,"Colour")
